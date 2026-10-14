@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# vdagent-watch: keep the SPICE mouse pointer aligned in Kali Linux VMs.
+#
+# Problem  GTK4 builds of spice-vdagent before Debian 0.23.0-4 (e.g. Kali
+#          0.23.0-3, Ubuntu 26.04 0.23.0-1ubuntu0.1) keep using the old screen
+#          geometry after the guest resolution changes on X11, so the arrow
+#          you see and the point you click drift apart. Kali bug #9653:
+#          https://bugs.kali.org/view.php?id=9653
+#          Fixed in Debian/Kali 0.23.0-4: upgrade and reboot if you can.
+#
+# Fix      Restarting the per-session agent makes it read the geometry again.
+#          This script does that automatically and only when needed: it waits
+#          for X RandR events (no polling, no CPU use while idle) and restarts
+#          the agent once per real resolution change, plus once at startup in
+#          case the pointer is already misaligned.
+#
+# Remove   once Kali ships a fixed spice-vdagent. The script logs and shows a
+#          notification when it finds a version newer than the buggy one.
+#
+# Needs    xev (x11-utils), xrandr (x11-xserver-utils), spice-vdagent
+# Logs     journalctl -t vdagent-watch
+# Project  https://github.com/JorgeXern/kali-spice-vdagent-pointer-fix (MIT)
+
+# Fail on unset variables. No `set -e`: grep, pkill and read return non-zero
+# in normal operation, and this script must keep running.
+set -u
+
+readonly NAME="vdagent-watch"
+readonly BUGGY_VERSION="0.23.0-3"   # last version known to have the bug
+
+log() { logger -t "$NAME" -- "$*"; }
+die() { echo "$NAME: $*" >&2; log "$*"; exit 1; }
+
+# --- Preconditions -----------------------------------------------------------
+
+for cmd in xev xrandr spice-vdagent flock; do
+  command -v "$cmd" >/dev/null || die "missing command '$cmd'"
+done
+[ -n "${DISPLAY:-}" ] || die "no X display; run it from the graphical session"
+
+# One instance per user: autostart plus a manual run must not race each other.
+# The lock lives on fd 9 and is released automatically when the script exits.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/$NAME-$UID.lock"
+flock -n 9 || { echo "$NAME: already running" >&2; exit 0; }
+
+# --- Has Kali shipped a newer agent? -----------------------------------------
+# A version newer than the buggy one may already contain the fix: say so in
+# the journal and, once the desktop is up, as a notification.
+
+version=$(dpkg-query -W -f='${Version}' spice-vdagent 2>/dev/null)
+if [ -n "$version" ] &&
+   dpkg --compare-versions "$version" gt "$BUGGY_VERSION"; then
+  msg="spice-vdagent is now $version. If the pointer stays aligned without"
+  msg+=" $NAME, the bug is fixed and you can uninstall it."
+  log "$msg"
+  if command -v notify-send >/dev/null; then
+    # Wait a bit so the notification daemon is up at login.
+    { sleep 10; notify-send "$NAME" "$msg"; } &
+  fi
+fi
+
+# --- Helpers -----------------------------------------------------------------
+
+# Print the resolution of the first connected output, e.g. "1920x1080".
+# Parses the xrandr line "Virtual-1 connected primary 1920x1080+0+0 (...)".
+current_resolution() {
+  xrandr --current 2>/dev/null |
+    awk '/ connected/ && match($0, /[0-9]+x[0-9]+[+]/) {
+           print substr($0, RSTART, RLENGTH - 1); exit }'
+}
+
+# Replace this session's agent with a fresh one that reads the new geometry.
+# -x matches the exact process name, so the system daemon (spice-vdagentd,
+# run by root) is never touched; -u limits the match to our own processes.
+# The agent forks to the background by itself. `9>&-` keeps the lock fd out
+# of it, otherwise the agent would hold the lock after this script exits.
+restart_agent() {
+  pkill -x -u "$UID" spice-vdagent
+  spice-vdagent 9>&-
+}
+
+# --- Main loop ---------------------------------------------------------------
+# xev prints one block per event; only the header line of each RandR screen
+# change matters. --line-buffered makes grep pass each line on immediately
+# instead of waiting for its output buffer to fill. `read` blocks without
+# using CPU until the next line arrives. The pipeline ends with the X session.
+#
+# The pipeline runs in the background and the script waits for it, so that
+# stopping the script (Ctrl+C, pkill) also stops xev and grep through the
+# EXIT trap. Bash would delay the trap while a foreground pipeline runs.
+
+trap 'pkill -P $$' EXIT
+trap 'exit 0' INT TERM HUP
+
+log "started (spice-vdagent ${version:-version unknown})"
+
+xev -root -event randr |
+  grep --line-buffered '^RRScreenChangeNotify' |
+  {
+    # Startup sync: the pointer may already be misaligned when this script
+    # starts (the resolution changed before installing it, or early in the
+    # login). Give the session's autostart entries a moment, then restart a
+    # running agent once. Events that arrive meanwhile wait in the pipe.
+    sleep 2
+    last=$(current_resolution)
+    if pgrep -x -u "$UID" spice-vdagent >/dev/null; then
+      restart_agent
+      log "startup sync (${last:-unknown resolution}): agent restarted"
+    fi
+
+    while read -r _; do
+      # A single resize produces a burst of events. Drain everything that
+      # arrives within one second, then act once on the final resolution.
+      while read -r -t 1 _; do :; done
+
+      current=$(current_resolution)
+
+      # Nothing to do if xrandr returned nothing or the size did not change.
+      if [ -z "$current" ] || [ "$current" = "$last" ]; then
+        continue
+      fi
+
+      restart_agent
+      log "resolution $current: agent restarted"
+      last=$current
+    done
+  } &
+wait $!
